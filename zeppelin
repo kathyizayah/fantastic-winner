@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+pragma solidity ^0.8.9;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./StorageProofs.sol";
+
+
+struct ExtendedValidatorInfo{
+    uint8 status; //NOT_VALIDATOR, ACTIVE, EXIT, SLASHED, CONFIRM_SLASHED
+    uint64 widthdrawableTime;
+}
+
+contract BridgeDrain{
+    mapping(address => uint256) public exits;
+    mapping(bytes32 => bytes32) public remoteAccountStateRoot;
+    mapping(bytes32 => uint256) public totalValidatorBalances;
+    mapping(address => uint256) public lastVotedBlockNumber;
+    mapping(bytes32 => mapping(uint256 => uint256)) public votesCount;
+    mapping(bytes32 => bool) public safeBlockHashes;
+
+    uint256 constant internalQuorumMultiplier = 2;
+
+    address immutable remoteBridgeSource;
+    bytes32 immutable domain;
+    uint256 constant epouchSize = 256;
+    BridgeSource immutable callback;
+    function hash2(bytes32 blockHash, uint256 blockNum) internal view returns (bytes32){
+        return keccak256(abi.encodePacked(blockHash, blockNum, domain));
+    }
+    
+
+    constructor(address _remoteBridgeSource, bytes32 _domain, BridgeSource _callback){
+        remoteBridgeSource = _remoteBridgeSource;
+        domain = _domain;
+        callback = _callback;
+    }
+
+    
+    function vote(
+        bytes32 prev,
+        uint256 prevNumber,
+        bytes32 blockHash,
+        uint256 blockNumber,
+        bytes memory blockHeaderRLP,
+        bytes memory accountStateProof,
+        bytes memory storageProof,
+        uint8 v, bytes32 r, bytes32 s)
+    external{
+        require(blockNumber % epouchSize == 0, "unaligned height");
+        require(blockNumber - prevNumber == epouchSize, "prev too far away");
+
+        require(safeBlockHashes[prev], "previous hash unsafe");
+        address validator = ecrecover(hash2(blockHash, blockNumber), v, r, s);
+
+        bytes32 accountRoot = remoteAccountStateRoot[prev];
+        if(uint256(accountRoot) == 0){
+            require(keccak256(blockHeaderRLP) == blockHash, "Incorrect block header");
+            accountRoot = StorageOracle.getStorageRoot(remoteBridgeSource, blockHeaderRLP, accountStateProof);
+            remoteAccountStateRoot[prev] = accountRoot;
+        }
+        uint256 balance = uint256(StorageOracle.getStorage(accountRoot, uint256(keccak256(abi.encodePacked(uint256(uint160(validator)), uint256(0)))), storageProof));
+        require(balance > 0, "your balance must be greater than 0");
+        uint256 sum = totalValidatorBalances[prev];
+        if(sum == 0){
+            sum = uint256(StorageOracle.getStorage(accountRoot, 0, storageProof));
+            assert(sum > 0); //SHOULD NEVER FAIL
+        }
+        
+        lastVotedBlockNumber[validator] = blockNumber;
+        
+        uint256 votes = votesCount[blockHash][blockNumber] + balance;
+        votesCount[blockHash][blockNumber] = votes;
+        if(votes * internalQuorumMultiplier > sum){
+            safeBlockHashes[blockHash] = true;
+        }
+    }
+}
+
+contract BridgeSource{
+    mapping(address => uint256) public validatorBalance;
+    uint256 public totalValidatorBalances;
+    mapping(address => ExtendedValidatorInfo) public extendedValidatorInfo;
+    
+    BridgeDrain immutable localBridgeDrain;
+    address immutable remoteBridgeDrain;
+    bytes32 immutable domain;
+    IERC20 immutable stakingToken;
+
+    uint256 constant whistleblowerRewardX1000 = 10;
+
+    constructor(address _remoteBridgeDrain, bytes32 _domain, BridgeDrain _localBridgeDrain, IERC20 _stakingToken){
+        remoteBridgeDrain = _remoteBridgeDrain;
+        domain = _domain;
+        localBridgeDrain = _localBridgeDrain;
+        stakingToken = _stakingToken;
+    }
+    function hash2(bytes32 blockHash, uint256 blockNum) internal view returns (bytes32){
+        return keccak256(abi.encodePacked(blockHash, blockNum, domain));
+    }
+
+    function proveFraud(bytes32 blockHash, uint256 blockNum, address rewardReceiver, uint8 v, bytes32 r, bytes32 s) external{
+        bytes32 correctHash = blockhash(blockNum);
+        require(uint256(correctHash) > 0, "pre-constantinople lookback limit reached");
+        if(blockNum < block.number){
+            require(blockHash != correctHash, "correctly hashed");
+        }
+        address validator = ecrecover(hash2(blockHash, blockNum), v, r, s);
+        ExtendedValidatorInfo memory validatorInfo = extendedValidatorInfo[validator];
+        require(validatorInfo.status > 0, "not validator");
+        require(validatorInfo.widthdrawableTime > block.timestamp, "withdrawable");
+
+        uint256 balance = validatorBalance[validator];
+
+        if(balance > 0){
+            validatorBalance[validator] = 0;
+            totalValidatorBalances -= balance;
+            SafeERC20.safeTransfer(stakingToken, rewardReceiver, (balance * whistleblowerRewardX1000) / 1000);
+        }
+    }
+
+}
